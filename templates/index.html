@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PolyTrack — Local Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main class="shell">
+    <header class="top">
+      <div>
+        <div class="eyebrow">PERSONAL ACCOUNT ANALYTICS</div>
+        <h1>PolyTrack</h1>
+        <p class="muted">A local dashboard for Polymarket US activity</p>
+      </div>
+      <div class="actions">
+        <button id="refresh">Refresh</button>
+        <a class="button secondary" href="/api/export.csv">Export CSV</a>
+      </div>
+    </header>
+
+    <div class="notice"><strong>Starter mode:</strong> the figures are based on local JSON files. Import sanitized activity data to populate the dashboard. API connection comes next.</div>
+
+    <section class="cards">
+      <article class="metric"><span>Total deposits</span><strong id="deposits">—</strong><small>Sum of recognized deposit records</small></article>
+      <article class="metric"><span>Total withdrawals</span><strong id="withdrawals">—</strong><small>Sum of recognized withdrawal records</small></article>
+      <article class="metric"><span>Net cash flow</span><strong id="cashflow">—</strong><small>Deposits minus withdrawals</small></article>
+      <article class="metric"><span>Realized P&amp;L</span><strong id="pnl">—</strong><small>Only if activity records provide it</small></article>
+      <article class="metric"><span>Account balance</span><strong id="balance">—</strong><small>From imported balance data</small></article>
+      <article class="metric"><span>Activity records</span><strong id="count">0</strong><small>Records currently loaded</small></article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div><h2>Account activity</h2><p class="muted">Search or filter imported records.</p></div>
+        <input id="search" type="search" placeholder="Search activity…">
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Date</th><th>Type</th><th>Description</th><th class="number">Amount</th></tr></thead>
+          <tbody id="rows"><tr><td colspan="4" class="empty">No data loaded yet.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <details class="panel import-panel">
+      <summary>Import sanitized JSON</summary>
+      <p class="muted">Expected shape: <code>{"activities":[...],"balances":{...}}</code>. Do not import cookies, API secrets, passwords, or authorization headers.</p>
+      <textarea id="jsonInput" spellcheck="false" placeholder='{"activities":[{"type":"deposit","amount":"25.00","timestamp":"2026-10-25"}],"balances":{"balance":"51.05"}}'></textarea>
+      <div class="actions"><button id="import">Import data</button><span id="importStatus" class="muted"></span></div>
+    </details>
+    <footer>Runs on this computer at 127.0.0.1:5050. This starter does not connect to or trade on your account.</footer>
+  </main>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
