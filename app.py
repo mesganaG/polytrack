@@ -1,119 +1,332 @@
-from flask import Flask, render_template, jsonify, request, send_file
-from pathlib import Path
 import csv
 import io
 import json
-from datetime import datetime, timezone
+from pathlib import Path
+
+from flask import Flask, jsonify, render_template, Response, request
 
 app = Flask(__name__)
-DATA_DIR = Path(__file__).parent / "data"
-ACTIVITY_FILE = DATA_DIR / "activity.json"
-BALANCE_FILE = DATA_DIR / "balances.json"
 
-DATA_DIR.mkdir(exist_ok=True)
+BASE_DIR = Path(__file__).resolve().parent
+DATA_FILE = BASE_DIR / "data" / "activities_normalized.json"
 
-def load_json(path, default):
-    if not path.exists():
-        return default
+
+# --------------------------------------------------
+# Load activities
+# --------------------------------------------------
+
+def load_activities():
+    if not DATA_FILE.exists():
+        return []
+
+    with DATA_FILE.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    if not isinstance(data, list):
+        raise ValueError("Activity JSON must contain a list.")
+
+    return [item for item in data if isinstance(item, dict)]
+
+
+# --------------------------------------------------
+# Helpers
+# --------------------------------------------------
+
+def number(value):
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return default
+        return float(value) if value is not None else None
+    except (ValueError, TypeError):
+        return None
 
-def amount(item, *keys):
-    for key in keys:
-        value = item.get(key)
-        if value is not None:
-            try:
-                return float(value)
-            except (ValueError, TypeError):
-                pass
-    return 0.0
 
-def summarize(activities, balances):
-    # Activity schema varies by endpoint. Do not silently classify unknown records.
-    deposits = withdrawals = realized_pnl = 0.0
-    categorized = []
-    for item in activities:
-        kind = str(item.get("type") or item.get("activityType") or item.get("kind") or "").lower()
-        value = amount(item, "amount", "amountUsd", "value", "usdcAmount")
-        pnl = amount(item, "realizedPnl", "realized_pnl", "pnl")
-        if "deposit" in kind:
-            deposits += abs(value)
-            category = "Deposit"
-        elif "withdraw" in kind:
-            withdrawals += abs(value)
-            category = "Withdrawal"
-        elif "realiz" in kind or "settle" in kind or "redeem" in kind:
-            realized_pnl += pnl if pnl else value
-            category = "Trading / settlement"
-        else:
-            category = item.get("displayType") or item.get("type") or "Activity"
-        categorized.append({
-            "date": item.get("timestamp") or item.get("createdAt") or item.get("time") or "",
-            "type": category,
-            "description": item.get("title") or item.get("marketTitle") or item.get("description") or item.get("marketSlug") or "",
-            "amount": value,
-            "raw": item
-        })
+def money_sum(items, field):
+    """Sum valid numeric values for a field."""
+    values = [
+        number(item.get(field))
+        for item in items
+    ]
 
-    balance_value = None
-    if isinstance(balances, dict):
-        for key in ("balance", "availableBalance", "currentBalance", "accountBalance", "total"):
-            if balances.get(key) is not None:
-                balance_value = amount(balances, key)
-                break
-        if balance_value is None and isinstance(balances.get("balances"), list):
-            balance_value = sum(amount(x, "balance", "currentBalance", "availableBalance") for x in balances["balances"])
-    elif isinstance(balances, list):
-        balance_value = sum(amount(x, "balance", "currentBalance", "availableBalance") for x in balances)
+    return sum(value for value in values if value is not None)
+
+
+# --------------------------------------------------
+# Summary calculations
+# --------------------------------------------------
+
+def get_summary(activities):
+    trades = [
+        item for item in activities
+        if item.get("activity_type") == "TRADE"
+    ]
+
+    resolutions = [
+        item for item in activities
+        if item.get("activity_type") == "POSITION_RESOLUTION"
+    ]
+
+    # Position-resolution realized P&L
+    pnl_values = [
+        number(item.get("realized_pnl"))
+        for item in resolutions
+    ]
+
+    pnl_values = [
+        value for value in pnl_values
+        if value is not None
+    ]
+
+    # Recorded commissions
+    commissions = [
+        number(item.get("commission"))
+        for item in activities
+    ]
+
+    commissions = [
+        value for value in commissions
+        if value is not None
+    ]
+
+    total_realized_pnl = sum(pnl_values)
+    total_commissions = sum(commissions)
+
+    # Wins and losses are based on resolution records with nonzero P&L.
+    wins = sum(value > 0 for value in pnl_values)
+    losses = sum(value < 0 for value in pnl_values)
+    decided = wins + losses
+
+    # Deposits include regular and advanced deposits.
+    deposit_types = {
+        "ACTIVITY_TYPE_ACCOUNT_DEPOSIT",
+        "ACTIVITY_TYPE_ACCOUNT_ADVANCED_DEPOSIT",
+    }
+
+    deposits = [
+        item for item in activities
+        if item.get("activity_type") in deposit_types
+    ]
+
+    withdrawals = [
+        item for item in activities
+        if item.get("activity_type")
+        == "ACTIVITY_TYPE_ACCOUNT_WITHDRAWAL"
+    ]
+
+    total_deposited = money_sum(deposits, "amount")
+    total_withdrawn = money_sum(withdrawals, "amount")
+
+    # Sum positive realized P&L only.
+    # This is not total payouts or unrealized profit.
+    total_money_won = sum(
+        value for value in pnl_values
+        if value > 0
+    )
+
+    # Count cash activities whose amount was not recognized.
+    missing_deposit_amounts = sum(
+        item.get("amount") is None
+        for item in deposits
+    )
+
+    missing_withdrawal_amounts = sum(
+        item.get("amount") is None
+        for item in withdrawals
+    )
 
     return {
-        "deposits": round(deposits, 2),
-        "withdrawals": round(withdrawals, 2),
-        "net_cash_flow": round(deposits - withdrawals, 2),
-        "realized_pnl": round(realized_pnl, 2),
-        "balance": round(balance_value, 2) if balance_value is not None else None,
-        "activity_count": len(activities),
-        "activities": categorized
+        # Activity totals
+        "total_records": len(activities),
+        "trade_count": len(trades),
+        "resolution_count": len(resolutions),
+
+        # P&L
+        "realized_pnl": round(total_realized_pnl, 2),
+        "recorded_commissions": round(total_commissions, 2),
+        "pnl_after_recorded_commissions": round(
+            total_realized_pnl - total_commissions, 2
+        ),
+
+        # Wins and losses
+        "wins": wins,
+        "losses": losses,
+        "win_rate_percent": round(
+            wins / decided * 100, 2
+        ) if decided else None,
+
+        # Cash flow
+        "total_deposited": round(total_deposited, 2),
+        "total_withdrawn": round(total_withdrawn, 2),
+        "net_cash_flow": round(
+            total_deposited - total_withdrawn, 2
+        ),
+
+        # Positive realized P&L only
+        "total_money_won": round(total_money_won, 2),
+
+        # Data-quality indicators
+        "deposit_count": len(deposits),
+        "withdrawal_count": len(withdrawals),
+        "deposits_missing_amount": missing_deposit_amounts,
+        "withdrawals_missing_amount": missing_withdrawal_amounts,
     }
+
+
+# --------------------------------------------------
+# Dashboard
+# --------------------------------------------------
 
 @app.get("/")
 def index():
     return render_template("index.html")
 
-@app.get("/api/summary")
-def api_summary():
-    activities = load_json(ACTIVITY_FILE, [])
-    balances = load_json(BALANCE_FILE, {})
-    if not isinstance(activities, list):
-        activities = []
-    return jsonify(summarize(activities, balances))
 
-@app.post("/api/import")
-def import_data():
-    """Import sanitized JSON exported by the user. No credentials are accepted or stored."""
-    payload = request.get_json(silent=True) or {}
-    activities = payload.get("activities", [])
-    balances = payload.get("balances", {})
-    if not isinstance(activities, list):
-        return jsonify({"error": "'activities' must be a list"}), 400
-    ACTIVITY_FILE.write_text(json.dumps(activities, indent=2), encoding="utf-8")
-    BALANCE_FILE.write_text(json.dumps(balances, indent=2), encoding="utf-8")
-    return jsonify({"ok": True, "activity_count": len(activities)})
+# --------------------------------------------------
+# Health check
+# --------------------------------------------------
 
-@app.get("/api/export.csv")
-def export_csv():
-    summary = summarize(load_json(ACTIVITY_FILE, []), load_json(BALANCE_FILE, {}))
-    out = io.StringIO()
-    writer = csv.DictWriter(out, fieldnames=["date", "type", "description", "amount"])
+@app.get("/api/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "app": "PolyTrack",
+    })
+
+
+# --------------------------------------------------
+# Trading summary API
+# --------------------------------------------------
+
+@app.get("/api/trading/summary")
+def trading_summary():
+    try:
+        activities = load_activities()
+        return jsonify(get_summary(activities))
+
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+# --------------------------------------------------
+# Trading activities API
+# --------------------------------------------------
+
+@app.get("/api/trading/activities")
+def trading_activities():
+    try:
+        activities = load_activities()
+
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    activity_type = request.args.get("type", "").upper()
+
+    if activity_type:
+        allowed_types = {
+            "TRADE",
+            "POSITION_RESOLUTION",
+            "ACTIVITY_TYPE_ACCOUNT_DEPOSIT",
+            "ACTIVITY_TYPE_ACCOUNT_ADVANCED_DEPOSIT",
+            "ACTIVITY_TYPE_ACCOUNT_WITHDRAWAL",
+        }
+
+        if activity_type not in allowed_types:
+            return jsonify({
+                "error": (
+                    "Unsupported type. Use TRADE, "
+                    "POSITION_RESOLUTION, or a supported "
+                    "account deposit/withdrawal activity type."
+                )
+            }), 400
+
+        activities = [
+            item for item in activities
+            if item.get("activity_type") == activity_type
+        ]
+
+    activities.sort(
+        key=lambda item: str(item.get("timestamp") or ""),
+        reverse=True,
+    )
+
+    try:
+        limit = int(request.args.get("limit", 500))
+    except ValueError:
+        return jsonify({
+            "error": "limit must be an integer"
+        }), 400
+
+    limit = max(1, min(limit, 5000))
+
+    return jsonify({
+        "count": len(activities),
+        "returned": min(len(activities), limit),
+        "activities": activities[:limit],
+    })
+
+
+# --------------------------------------------------
+# CSV export
+# --------------------------------------------------
+
+@app.get("/api/trading/export.csv")
+def export_trading_csv():
+    try:
+        activities = load_activities()
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    output = io.StringIO()
+
+    fields = [
+        "timestamp",
+        "activity_type",
+        "activity_id",
+        "market_title",
+        "market_slug",
+        "outcome",
+        "side",
+        "action",
+        "price",
+        "quantity",
+        "amount",
+        "commission",
+        "realized_pnl",
+        "status",
+    ]
+
+    writer = csv.DictWriter(
+        output,
+        fieldnames=fields,
+        extrasaction="ignore",
+    )
+
     writer.writeheader()
-    for item in summary["activities"]:
-        writer.writerow({k: item.get(k, "") for k in writer.fieldnames})
-    mem = io.BytesIO(out.getvalue().encode("utf-8-sig"))
-    mem.seek(0)
-    return send_file(mem, mimetype="text/csv", as_attachment=True, download_name="polytrack-activity.csv")
+
+    for item in activities:
+        writer.writerow({
+            field: item.get(field)
+            for field in fields
+        })
+
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition":
+                "attachment; filename=polytrack_trading_history.csv"
+        },
+    )
+
+
+# --------------------------------------------------
+# Start application
+# --------------------------------------------------
 
 if __name__ == "__main__":
-    # Local-only binding: do not expose this dashboard to your network.
-    app.run(host="127.0.0.1", port=5050, debug=False)
+    print("\nPolyTrack registered routes:")
+    print(app.url_map)
+
+    app.run(
+        host="127.0.0.1",
+        port=5050,
+        debug=True,
+    )
